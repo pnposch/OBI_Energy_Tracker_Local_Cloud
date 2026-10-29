@@ -23,6 +23,7 @@
 #include <PubSubClient.h>         // knolleary/PubSubClient
 #include <Preferences.h>
 #include <LittleFS.h>             // per-reader energy history log -- fallback 128 KB "userdata" partition
+#include "history_io.h"
 #include "ota_hist.h"              // ...or, on obi_gateway_c3, the far larger unused OTA-partition tail
 #include <dirent.h>                // opendir/readdir -- history file listing works against either store
 #include <time.h>                 // NTP wall-clock -> per-day kWh buckets
@@ -169,7 +170,7 @@ static bool          g_updPubDirty  = true;    // republish <gw>/update on the n
 static volatile bool g_ghInstallReq = false;   // set by the MQTT install command, consumed in mqttService()
 
 // Periodic FTP history backup: OFF by default. Every run uploads BOTH each reader's daily CSV (see
-// buildDailyCsv()) and its raw sample log (buildRawCsv() -- the same data the History page's "download raw
+// writeHistoryCsv()) and its raw sample log (writeHistoryCsv() -- the same data the History page's "download raw
 // as CSV" button produces), always together -- not a separate option, just what "back up the history" means
 // here. Files are timestamped ("<id>_daily_<unixtime>.csv" / "<id>_raw_<unixtime>.csv") so a run never
 // overwrites a previous one, and kept in separate "daily"/"raw" subfolders (FTP_DAILY_DIR/FTP_RAW_DIR below)
@@ -208,8 +209,7 @@ static uint8_t  g_ftpMinute = 0;    // 0-59
 static uint32_t g_ftpTimeFiredDay = 0xFFFFFFFF;   // epoch/86400 of the last day the time trigger fired -- so
                                                    // it fires exactly once per matching minute, not every
                                                    // loop iteration for the whole 60s the clock matches HH:MM
-// Which slice of the on-device history each export contains -- see ftpWindowBounds()/buildDailyCsv()/
-// buildRawCsv(). 0 = everything currently stored (the original, unfiltered behavior -- default, so enabling
+// Which slice of the on-device history each export contains -- see ftpWindowBounds()/writeHistoryCsv(). 0 = everything currently stored (the original, unfiltered behavior -- default, so enabling
 // FTP alone doesn't silently start dropping data someone might have been relying on getting in full).
 static uint8_t  g_ftpWindow = 0;   // 0=all 1=24h 2=prevday 3=7d 4=30d
 static uint32_t g_ftpWinStart = 0, g_ftpWinEnd = 0xFFFFFFFF;   // set once per run by ftpUploadTask(), just
@@ -913,7 +913,7 @@ static void handleSelfOtaUpload() {
     // this is just about not racing a live filesystem against the incoming flash write). This is THE
     // single choke point for self-OTA: browser upload, push.py, and any headless/remote trigger (cloud
     // path) all post here, so wrapping it here covers every caller in one place.
-    otaHist_prepareForFlash();
+    if (!otaHist_prepareForFlash()) { s_selfOtaOk = false; return; }
     s_selfOtaOk = Update.begin(UPDATE_SIZE_UNKNOWN);        // grow into the whole free OTA partition
     if (!s_selfOtaOk) { Update.printError(Serial); otaHist_abortFlash(); }
     Serial.printf("[selfota] start: %s\n", up.filename.c_str());
@@ -1077,7 +1077,12 @@ static void ghOtaTask(void *) {
   mqtt.disconnect();
   // Same pause as the self-update path (see handleSelfOtaUpload) -- this is the OTHER of the two places
   // that call Update.begin(..., U_FLASH), so it needs the identical treatment.
-  otaHist_prepareForFlash();
+  if (!otaHist_prepareForFlash()) {
+    g_ghLastError = "history snapshot failed";
+    g_ghState = 3;
+    vTaskDelete(nullptr);
+    return;
+  }
   bool ok = false;
   String tag, url;
   // Re-resolves the release/asset URL even though the caller (the auto-update loop, or the settings page's
@@ -1626,23 +1631,6 @@ static void dailySpace(size_t &total, size_t &used) {
 static String fpS(const String &id) { return g_rawBase + "/s" + id; }
 static String fpD(const String &id) { return g_dailyBase + "/d" + id; }
 
-static String fsRead(const String &path) {
-  FILE *f = fopen(path.c_str(), "rb");
-  if (!f) return String();
-  String s; char buf[512]; size_t n;
-  while ((n = fread(buf, 1, sizeof buf, f)) > 0) s.concat(buf, n);
-  fclose(f);
-  return s;
-}
-static bool fsWrite(const String &path, const String &data) {
-  FILE *f = fopen(path.c_str(), "wb");
-  if (!f) return false;
-  size_t n = data.length();
-  bool ok = (n == 0) || (fwrite(data.c_str(), 1, n, f) == n);
-  fclose(f);
-  return ok;
-}
-
 // Per-reader raw-sample file cap before compaction -- 5x larger on the OTA-tail store (many times the
 // space of the 128 KB fallback, so it can actually hold "much longer" history rather than the same ~8 KB
 // per reader sitting in a bigger-but-otherwise-unused partition).
@@ -1652,17 +1640,8 @@ static size_t sampleTrimBytes() { return g_usingOtaHist ? 25000 : 5000; }
 // Append one line to `path`, then keep it bounded to capBytes (trim to trimBytes, snapped to a line
 // boundary).
 static void appendLineCapped(const String &path, const char *line, size_t capBytes, size_t trimBytes) {
-  FILE *f = fopen(path.c_str(), "a");
-  if (!f) return;
-  fputs(line, f);
-  long sz = ftell(f);
-  fclose(f);
-  if (sz > (long)capBytes) {
-    String all = fsRead(path);
-    int cut = (int)all.length() - (int)trimBytes;
-    int nl  = all.indexOf('\n', cut > 0 ? cut : 0);
-    if (nl >= 0) fsWrite(path, all.substring(nl + 1));
-  }
+  if (!historyAppend(path.c_str(), line, capBytes, trimBytes))
+    Serial.println("[history] sample write failed");
 }
 
 // Append one sample line, then keep the file bounded (drop the oldest lines past the cap). No separate
@@ -1721,45 +1700,30 @@ static size_t dailyCapBytes() {
   return budget / (size_t)dailyReaderCount();
 }
 
-// Return daily CSV with one row upserted. The same helper persists completed days and adds today's
-// RAM-only row to API responses. `capBytes` is this reader's current fair share (see dailyCapBytes());
-// trimming is byte-based (like appendLineCapped()'s raw-sample cap) rather than a fixed row count so it
-// grows and shrinks smoothly as the reader count changes instead of jumping between fixed slot sizes.
-static String withDailyRow(String all, uint32_t dayStart, uint32_t imp, uint32_t exp,
-                            uint32_t dayWh, uint32_t nightWh,
-                            uint32_t htWh, uint32_t stWh, uint32_t ntWh, size_t capBytes) {
-  char row[110];
-  snprintf(row, sizeof row, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu", (unsigned long)dayStart, (unsigned long)imp,
+// Format a bounded daily CSV row.
+static void dailyRow(char *row, size_t size, uint32_t dayStart, uint32_t imp, uint32_t exp,
+                     uint32_t dayWh, uint32_t nightWh, uint32_t htWh, uint32_t stWh, uint32_t ntWh) {
+  snprintf(row, size, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n", (unsigned long)dayStart, (unsigned long)imp,
            (unsigned long)exp, (unsigned long)dayWh, (unsigned long)nightWh,
            (unsigned long)htWh, (unsigned long)stWh, (unsigned long)ntWh);
-  String content;
-  if (all.length() == 0) {
-    content = String(row) + "\n";
-  } else {
-    int end = (int)all.length();
-    if (all[end - 1] == '\n') end--;                     // ignore trailing newline
-    int start = all.lastIndexOf('\n', end - 1) + 1;      // start index of the last line (0 if single line)
-    uint32_t lastDay = strtoul(all.substring(start, end).c_str(), nullptr, 10);
-    if (lastDay == dayStart) content = all.substring(0, start) + row + "\n";   // replace today's row
-    else {
-      content = all;
-      if (content.length() && content[content.length() - 1] != '\n') content += "\n";
-      content += String(row) + "\n";                     // a new day -> append
+}
+
+static void currentDaily(const String &id, char *row, size_t size) {
+  row[0] = 0;
+  for (int i = 0; i < MAX_READERS; i++)
+    if (hDaily[i].day && readers[i].used && hex(readers[i].handle, 3) == id) {
+      dailyRow(row, size, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh,
+               hDaily[i].nightWh, hDaily[i].htWh, hDaily[i].stWh, hDaily[i].ntWh);
+      return;
     }
-  }
-  // trim the oldest rows until back under this reader's current fair-share budget
-  if (content.length() > capBytes) {
-    int cut = (int)content.length() - (int)capBytes;
-    int nl = content.indexOf('\n', cut > 0 ? cut : 0);
-    content = (nl >= 0) ? content.substring(nl + 1) : String();
-  }
-  return content;
 }
 
 static void persistDaily(const String &id, uint32_t dayStart, uint32_t imp, uint32_t exp,
                           uint32_t dayWh, uint32_t nightWh, uint32_t htWh, uint32_t stWh, uint32_t ntWh) {
-  String path = fpD(id);
-  fsWrite(path, withDailyRow(fsRead(path), dayStart, imp, exp, dayWh, nightWh, htWh, stWh, ntWh, dailyCapBytes()));
+  char row[110];
+  dailyRow(row, sizeof row, dayStart, imp, exp, dayWh, nightWh, htWh, stWh, ntWh);
+  if (!historySave(fpD(id).c_str(), row, dailyCapBytes()))
+    Serial.println("[history] daily write failed");
 }
 
 static uint32_t localDayStart(time_t ep) {
@@ -1770,7 +1734,7 @@ static uint32_t localDayStart(time_t ep) {
 }
 
 // The [start,end) epoch bounds for the FTP export's currently-selected data window (g_ftpWindow) -- used by
-// buildDailyCsv()/buildRawCsv() to filter rows, so a bounded preset produces a distinct, non-overlapping
+// writeHistoryCsv() to filter rows, so a bounded preset produces a distinct, non-overlapping
 // slice each run instead of always dumping everything currently on flash. start=0/end=UINT32_MAX means "no
 // filtering" (preset 0, or the clock isn't synced yet and a wall-clock window can't be computed at all --
 // safer to export everything than to silently apply a wrong window against a bad clock).
@@ -1790,13 +1754,10 @@ static void ftpWindowBounds(uint32_t &startEp, uint32_t &endEp) {
 // Recover the newest flash-backed sample after a reboot. If the gateway was down across midnight this
 // is the best durable closing value for the previous day; during normal operation the RAM cache is newer.
 static bool lastSample(const String &id, uint32_t &ep, uint32_t &imp, uint32_t &exp) {
-  String all = fsRead(fpS(id));
-  int end = (int)all.length();
-  while (end > 0 && (all[end - 1] == '\n' || all[end - 1] == '\r')) end--;
-  if (end == 0) return false;
-  int start = all.lastIndexOf('\n', end - 1) + 1;
+  char row[128];
+  if (!historyLast(fpS(id).c_str(), row, sizeof row)) return false;
   unsigned long e, i, x;
-  if (sscanf(all.substring(start, end).c_str(), "%lu,%lu,%lu", &e, &i, &x) != 3) return false;
+  if (sscanf(row, "%lu,%lu,%lu", &e, &i, &x) != 3) return false;
   ep = (uint32_t)e; imp = (uint32_t)i; exp = (uint32_t)x;
   return true;
 }
@@ -1807,13 +1768,10 @@ static bool lastSample(const String &id, uint32_t &ep, uint32_t &imp, uint32_t &
 // the raw sample log. That makes it the right fallback for beginDay()'s "reboot happened today, not
 // overnight" case below.
 static bool lastDailyRow(const String &id, uint32_t &dayStart, uint32_t &imp, uint32_t &exp) {
-  String all = fsRead(fpD(id));
-  int end = (int)all.length();
-  while (end > 0 && (all[end - 1] == '\n' || all[end - 1] == '\r')) end--;
-  if (end == 0) return false;
-  int start = all.lastIndexOf('\n', end - 1) + 1;
+  char row[128];
+  if (!historyLast(fpD(id).c_str(), row, sizeof row)) return false;
   unsigned long d, i, x;
-  if (sscanf(all.substring(start, end).c_str(), "%lu,%lu,%lu", &d, &i, &x) != 3) return false;
+  if (sscanf(row, "%lu,%lu,%lu", &d, &i, &x) != 3) return false;
   dayStart = (uint32_t)d; imp = (uint32_t)i; exp = (uint32_t)x;
   return true;
 }
@@ -1999,12 +1957,12 @@ static void historyService() {
 }
 
 // Stream a CSV blob as a JSON array-of-arrays (empty field -> null), chunked to keep RAM low.
-static void streamRows(const String &csv) {
-  int i = 0, n = (int)csv.length(); bool firstRow = true;
+static void streamRows(HistoryRows &rows) {
+  bool firstRow = true;
+  char buffer[128];
   String chunk; chunk.reserve(1600);
-  while (i < n) {
-    int nl = csv.indexOf('\n', i); if (nl < 0) nl = n;
-    String line = csv.substring(i, nl); line.trim(); i = nl + 1;
+  while (rows.next(buffer, sizeof buffer)) {
+    String line(buffer); line.trim();
     if (!line.length()) continue;
     // Sanity-bound the epoch (always the first column, for both samples and daily rows) — same range as
     // timeValid(). Drops rows written while the system clock was corrupted (e.g. a failed mktime() call
@@ -2129,17 +2087,12 @@ static void handleHistoryApi() {
                      ",\"tariff_mode\":" + String(tariffMode) +
                      ",\"ht_price\":" + String(htPriceCent, 2) +
                      ",\"nt_price\":" + String(ntPriceCent, 2) + ",\"samples\":[");
-  { String s = g_fsOk ? fsRead(fpS(id)) : String(); streamRows(s); }
+  if (g_fsOk) { HistoryRows rows(fpS(id).c_str()); streamRows(rows); }
   server.sendContent("],\"daily\":[");
-  {
-    String d = g_fsOk ? fsRead(fpD(id)) : String();
-    for (int i = 0; i < MAX_READERS; i++)
-      if (hDaily[i].day && readers[i].used && hex(readers[i].handle, 3) == id) {
-        d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh, hDaily[i].nightWh,
-                        hDaily[i].htWh, hDaily[i].stWh, hDaily[i].ntWh, dailyCapBytes());
-        break;
-      }
-    streamRows(d);
+  if (g_fsOk) {
+    char row[110]; currentDaily(id, row, sizeof row);
+    HistoryRows rows(fpD(id).c_str(), row[0] ? row : nullptr);
+    streamRows(rows);
   }
   server.sendContent("]}");
   server.sendContent("");                                // terminate the chunked response
@@ -2151,54 +2104,25 @@ static String isoLocal(time_t ep) {
   return String(b);
 }
 
-// Build the daily CSV for one reader (same content handleHistoryCsv's kind=daily download produces), as a
-// plain in-memory String rather than streamed to an HTTP response -- used by the periodic FTP upload below.
-// Daily logs stay small even after years (see ota_hist.h), so building the whole thing in RAM first is fine
-// here (unlike the raw/sample log, which the HTTP download path keeps chunked instead).
-static String buildDailyCsv(const String &id) {
-  if (!g_fsOk) return String();
-  String d = fsRead(fpD(id));
-  for (int i = 0; i < MAX_READERS; i++)
-    if (hDaily[i].day && readers[i].used && hex(readers[i].handle, 3) == id) {
-      d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh, hDaily[i].nightWh,
-                        hDaily[i].htWh, hDaily[i].stWh, hDaily[i].ntWh, dailyCapBytes());
-      break;
-    }
-  String out = "date,day_start_epoch,import_wh,export_wh,day_wh,night_wh,ht_wh,st_wh,nt_wh\n";
-  int i = 0, n = (int)d.length();
-  while (i < n) {
-    int nl = d.indexOf('\n', i); if (nl < 0) nl = n;
-    String line = d.substring(i, nl); line.trim(); i = nl + 1;
-    if (!line.length()) continue;
-    int fc = line.indexOf(',');
-    unsigned long ep = strtoul((fc < 0 ? line : line.substring(0, fc)).c_str(), nullptr, 10);
-    if (ep <= 1735689600UL || ep >= 4102444800UL) continue;   // same epoch sanity bound as sendCsvRows()
-    if (ep < g_ftpWinStart || ep >= g_ftpWinEnd) continue;    // outside the FTP export's selected window (see ftpWindowBounds())
-    out += isoLocal((time_t)ep); out += ","; out += line; out += "\n";
-  }
-  return out;
-}
+static const char *dailyHeader = "date,day_start_epoch,import_wh,export_wh,day_wh,night_wh,ht_wh,st_wh,nt_wh\n";
+static const char *rawHeader = "date,epoch,import_wh,export_wh,power_w\n";
 
-// Build the RAW-sample CSV for one reader (same content the /api/history/csv?kind=raw download produces),
-// as a plain in-memory String -- used by the periodic FTP upload's raw-data export, alongside the daily one.
-// Unlike buildDailyCsv() there's no live-RAM-row merge: the on-flash /s<id> file already has everything not
-// yet trimmed off the ring buffer, nothing still-accumulating to fold in.
-static String buildRawCsv(const String &id) {
-  if (!g_fsOk) return String();
-  String d = fsRead(fpS(id));
-  String out = "date,epoch,import_wh,export_wh,power_w\n";
-  int i = 0, n = (int)d.length();
-  while (i < n) {
-    int nl = d.indexOf('\n', i); if (nl < 0) nl = n;
-    String line = d.substring(i, nl); line.trim(); i = nl + 1;
-    if (!line.length()) continue;
-    int fc = line.indexOf(',');
-    unsigned long ep = strtoul((fc < 0 ? line : line.substring(0, fc)).c_str(), nullptr, 10);
-    if (ep <= 1735689600UL || ep >= 4102444800UL) continue;   // same epoch sanity bound as sendCsvRows()
-    if (ep < g_ftpWinStart || ep >= g_ftpWinEnd) continue;    // outside the FTP export's selected window (see ftpWindowBounds())
-    out += isoLocal((time_t)ep); out += ","; out += line; out += "\n";
+// Stream exports without whole-file allocations.
+static bool writeHistoryCsv(WiFiClient &client, const String &id, bool daily) {
+  char live[110] = {};
+  if (daily) currentDaily(id, live, sizeof live);
+  HistoryRows rows((daily ? fpD(id) : fpS(id)).c_str(), live[0] ? live : nullptr);
+  const char *header = daily ? dailyHeader : rawHeader;
+  if (!rows.ok() || client.print(header) != strlen(header)) return false;
+  char buffer[128];
+  while (rows.next(buffer, sizeof buffer)) {
+    String line(buffer); line.trim();
+    unsigned long ep = strtoul(buffer, nullptr, 10);
+    if (ep <= 1735689600UL || ep >= 4102444800UL || ep < g_ftpWinStart || ep >= g_ftpWinEnd) continue;
+    String out = isoLocal((time_t)ep) + "," + line + "\n";
+    if (client.print(out) != out.length()) return false;
   }
-  return out;
+  return rows.ok();
 }
 
 // Every reader id (6 hex chars) that has a /<prefix><id> log on flash, live or not -- the set the FTP
@@ -2307,9 +2231,8 @@ static bool ftpCmd(WiFiClient &c, const String &cmd, int expect, String *line = 
                                         (code == 0 ? String("timeout") : String(code) + " " + l);
   return code == expect;
 }
-// Upload one in-memory buffer as a file over a fresh PASV data connection. Control connection must already
-// be logged in and CWD'd into the target directory.
-static bool ftpStor(WiFiClient &ctrl, const String &filename, const String &content) {
+// Stream history through a PASV connection.
+static bool ftpStor(WiFiClient &ctrl, const String &filename, const String &id, bool daily) {
   String reply;
   if (!ftpCmd(ctrl, "TYPE I", 200)) return false;
   if (!ftpCmd(ctrl, "PASV", 227, &reply)) return false;
@@ -2357,11 +2280,10 @@ static bool ftpStor(WiFiClient &ctrl, const String &filename, const String &cont
       return false;
     }
   }
-  size_t written = dataConn.write((const uint8_t *)content.c_str(), content.length());
-  ftpLog("wrote " + String((unsigned)written) + "/" + String((unsigned)content.length()) + " bytes to the data connection");
+  bool written = writeHistoryCsv(dataConn, id, daily);
   dataConn.stop();
-  if (written != content.length()) {
-    g_ftpLastError = "only wrote " + String((unsigned)written) + "/" + String((unsigned)content.length()) + " bytes";
+  if (!written) {
+    g_ftpLastError = "history read or upload failed";
     return false;
   }
   int code = ftpReadReply(ctrl, nullptr, 15000);   // "226 Transfer complete" -- can take a while on a slow link
@@ -2381,11 +2303,11 @@ static bool ftpEnterDir(WiFiClient &ctrl, const String &seg) {
 // Upload every reader's file for one content type ("daily" or "raw") into its own subfolder under the
 // current directory (see FTP_DAILY_DIR/FTP_RAW_DIR -- kept as separate subfolders, not just a filename
 // difference, so a directory listing alone tells the two exports apart), then CWD back up so the caller is
-// ready for the next type. buildFn returns the CSV content for one reader id; tag becomes the _daily_/_raw_
+// ready for the next type. tag becomes the _daily_/_raw_
 // filename infix. Returns false only on an actual transfer error -- having nothing to upload yet
 // (nIdsOut==0, e.g. right after enabling this) is reported via nIdsOut/uploadedOut, not itself a failure.
 static bool ftpUploadKind(WiFiClient &ctrl, const char *dirName, char idPrefix, const char *tag,
-                           String (*buildFn)(const String &), uint32_t ts, int &uploadedOut, int &nIdsOut) {
+                           uint32_t ts, int &uploadedOut, int &nIdsOut) {
   uploadedOut = 0; nIdsOut = 0;
   if (!ftpEnterDir(ctrl, dirName)) {
     ftpLog(String("could not enter/create the \"") + dirName + "\" subfolder");
@@ -2396,11 +2318,9 @@ static bool ftpUploadKind(WiFiClient &ctrl, const char *dirName, char idPrefix, 
   ftpLog(String(nIds) + " reader(s) with stored " + tag + " history to upload");
   bool ok = true;
   for (int i = 0; i < nIds && ok; i++) {
-    String csv = buildFn(ids[i]);
-    if (!csv.length()) { ftpLog(ids[i] + ": nothing recorded yet, skipping"); continue; }
     String fname = ids[i] + "_" + tag + "_" + String(ts) + ".csv";
-    ftpLog("uploading " + fname + " (" + String((unsigned)csv.length()) + " B)");
-    if (ftpStor(ctrl, fname, csv)) { uploadedOut++; ftpLog(fname + " ok"); }
+    ftpLog("uploading " + fname);
+    if (ftpStor(ctrl, fname, ids[i], idPrefix == 'd')) { uploadedOut++; ftpLog(fname + " ok"); }
     else { ok = false; ftpLog(fname + " failed: " + g_ftpLastError); }
   }
   ftpLog(String(uploadedOut) + "/" + String(nIds) + " " + tag + " file(s) uploaded");
@@ -2413,8 +2333,8 @@ static bool ftpUploadKind(WiFiClient &ctrl, const char *dirName, char idPrefix, 
 static void ftpUploadTask(void *) {
   bool ok = false;
   g_ftpLastError = "";
-  ftpWindowBounds(g_ftpWinStart, g_ftpWinEnd);   // fixed for this whole run -- both buildDailyCsv() and
-                                                  // buildRawCsv() read it back for every reader below
+  ftpWindowBounds(g_ftpWinStart, g_ftpWinEnd);   // fixed for this whole run -- both writeHistoryCsv() and
+                                                  // writeHistoryCsv() read it back for every reader below
   ftpLog("connecting to " + String(g_ftpHost) + ":" + String(g_ftpPort) + " ...");
   WiFiClient ctrl;
   if (ctrl.connect(g_ftpHost, g_ftpPort, 10000)) {
@@ -2439,8 +2359,8 @@ static void ftpUploadTask(void *) {
       if (ok) {
         uint32_t ts = timeValid() ? (uint32_t)time(nullptr) : (uint32_t)(millis() / 1000);
         int dailyUploaded, dailyIds, rawUploaded, rawIds;
-        ok = ftpUploadKind(ctrl, FTP_DAILY_DIR, 'd', "daily", buildDailyCsv, ts, dailyUploaded, dailyIds);
-        if (ok) ok = ftpUploadKind(ctrl, FTP_RAW_DIR, 's', "raw", buildRawCsv, ts, rawUploaded, rawIds);
+        ok = ftpUploadKind(ctrl, FTP_DAILY_DIR, 'd', "daily", ts, dailyUploaded, dailyIds);
+        if (ok) ok = ftpUploadKind(ctrl, FTP_RAW_DIR, 's', "raw", ts, rawUploaded, rawIds);
         else { rawUploaded = 0; rawIds = 0; }
         if (ok && dailyUploaded + rawUploaded == 0 && dailyIds == 0 && rawIds == 0) {
           g_ftpLastError = "no reader has any stored history yet";
@@ -2467,13 +2387,12 @@ static void ftpUploadTask(void *) {
 // Stream a CSV blob (epoch-prefixed lines already on flash, same layout as the /s|/d files) out as a
 // downloadable CSV: a header row, then each line with a local-time column prepended. Same epoch sanity
 // filter as streamRows() so a poisoned row (see that comment) doesn't end up in the export either.
-static void sendCsvRows(const String &csv, const char *header) {
-  server.sendContent(header); server.sendContent("\n");
-  int i = 0, n = (int)csv.length();
+static void sendCsvRows(HistoryRows &rows, const char *header) {
+  server.sendContent(header);
+  char buffer[128];
   String chunk; chunk.reserve(1600);
-  while (i < n) {
-    int nl = csv.indexOf('\n', i); if (nl < 0) nl = n;
-    String line = csv.substring(i, nl); line.trim(); i = nl + 1;
+  while (rows.next(buffer, sizeof buffer)) {
+    String line(buffer); line.trim();
     if (!line.length()) continue;
     int fc = line.indexOf(',');
     unsigned long ep = strtoul((fc < 0 ? line : line.substring(0, fc)).c_str(), nullptr, 10);
@@ -2502,18 +2421,10 @@ static void handleHistoryCsv() {
                      String("attachment; filename=\"obi_") + id + (daily ? "_daily.csv\"" : "_raw.csv\""));
   server.send(200, "text/csv", "");
   if (g_fsOk) {
-    if (daily) {
-      String d = fsRead(fpD(id));
-      for (int i = 0; i < MAX_READERS; i++)
-        if (hDaily[i].day && readers[i].used && hex(readers[i].handle, 3) == id) {
-          d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp, hDaily[i].dayWh, hDaily[i].nightWh,
-                        hDaily[i].htWh, hDaily[i].stWh, hDaily[i].ntWh, dailyCapBytes());
-          break;
-        }
-      sendCsvRows(d, "date,day_start_epoch,import_wh,export_wh,day_wh,night_wh,ht_wh,st_wh,nt_wh");
-    } else {
-      sendCsvRows(fsRead(fpS(id)), "date,epoch,import_wh,export_wh,power_w");
-    }
+    char row[110] = {};
+    if (daily) currentDaily(id, row, sizeof row);
+    HistoryRows rows((daily ? fpD(id) : fpS(id)).c_str(), row[0] ? row : nullptr);
+    sendCsvRows(rows, daily ? dailyHeader : rawHeader);
   }
   server.sendContent("");                                 // terminate the chunked response
 }
