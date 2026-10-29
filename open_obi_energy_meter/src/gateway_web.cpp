@@ -1,3 +1,4 @@
+#include "json_string.h"
 // gateway_web.cpp — WiFi captive portal + web dashboard + MQTT.
 // Runs on its own FreeRTOS task pinned to core 0 so the HTTP/MQTT work never stutters the
 // LoRa gateway (which runs on the Arduino loop, core 1).
@@ -282,7 +283,6 @@ static const char *mqttStateText(int s) {
     case 5: return "unauthorized"; default: return "?";
   }
 }
-static String jstr(const char *s) { String o = "\""; for (; *s; s++) { if (*s == '"' || *s == '\\') o += '\\'; o += *s; } return o + "\""; }
 // 0.0.0.0 is IPAddress's zero-value, returned e.g. by WiFi.dnsIP(1) when the network only hands out one DNS
 // server -- report that as "unset" (empty string) rather than a literal "0.0.0.0" the Settings page would
 // otherwise prefill into the DNS 2 field as if it meant something.
