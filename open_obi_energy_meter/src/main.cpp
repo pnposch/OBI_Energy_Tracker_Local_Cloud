@@ -651,6 +651,11 @@ uint32_t gw_ota_size() { return g_otaSize; }
 uint32_t gw_ota_progress() { return g_otaServed > g_otaSize ? g_otaSize : g_otaServed; }
 void gw_ota_target(uint8_t out[3]) { memcpy(out, g_otaTarget, 3); }
 
+static bool otaAccepts(const uint8_t handle[3]) {
+  if (!g_ota || memcmp(handle, g_otaTarget, 3)) return false;
+  return g_otaActive || (g_otaPulled && (int32_t)(g_otaSfHoldMs - millis()) > 0);
+}
+
 // serve one cmd-33 request. request payload = [f0][deviceType][f2][offset:4 big-endian]
 static void serveOtaRequest(const uint8_t handle[3], const uint8_t *req, size_t rlen) {
   if (rlen < 7 || !g_ota) return;
@@ -677,7 +682,7 @@ static void serveOtaRequest(const uint8_t handle[3], const uint8_t *req, size_t 
     char note[16]; snprintf(note, sizeof note, "b@%u", (unsigned)pos);
     txFrame(f, n, note);
     if (pos < g_otaSize) { uint32_t s = pos + 64 > g_otaSize ? g_otaSize : pos + 64; if (s > g_otaServed) g_otaServed = s; }
-    if (g_otaServed >= g_otaSize) {                   // whole image served -> stop advertising the version
+    if (g_otaActive && g_otaServed >= g_otaSize) {                   // whole image served -> stop advertising the version
       g_otaActive = false;
       g_otaSfHoldMs = millis() + 3000;   // give the reader a few seconds to re-request a block if its own CRC check fails
       Serial.println("[ota] full image served — disarmed (reader will validate & flash)");
@@ -1009,7 +1014,7 @@ static void handleRx() {
     case 33: {                                             // reader bootloader OTA pull (metadata/block)
       Reader *r = addReader(handle);                         // show a stuck-in-bootloader reader in the UI
       if (r) { r->lastRssi = rssi; r->lastSnr = snr; r->lastSeenMs = millis(); r->inBootloader = true; }
-      if (g_otaActive && !memcmp(handle, g_otaTarget, 3)) { g_otaPulled = true; serveOtaRequest(handle, d + 4, len - 4); }
+      if (otaAccepts(handle)) { g_otaPulled = true; serveOtaRequest(handle, d + 4, len - 4); }
       else Serial.printf("  cmd33 (OTA pull) but no armed image for %02X%02X%02X\n", handle[0], handle[1], handle[2]);
       break;
     }
@@ -1281,6 +1286,7 @@ static void loraTask(void *) {
     if (g_rx) { g_rx = false; handleRx(); }
     uint32_t now = millis();
     bool ota = gw_ota_active();
+    if (!ota && g_otaPulled && (int32_t)(now - g_otaSfHoldMs) >= 0) g_otaPulled = false;
     if (now - lastBeacon >= 1000u) { lastBeacon = now; sendBeacon(); }   // keep 1 Hz beacon (readers pace to it)
     if (!ota && now - lastScan >= 3000) { lastScan = now; sendScan(); }
     if (!ota)                                         // re-pair safety net for assigned, not-yet-keyed readers
@@ -1298,7 +1304,7 @@ static void loraTask(void *) {
     // an OTA forced the radio to SF7 for the reader's bootloader -- once it's fully finished (not just
     // served -- g_otaSfHoldMs also covers a few seconds for a stray retry) and the desired steady-state SF
     // differs, switch back.
-    if (!ota && g_liveSF != g_loraSF && (g_otaSfHoldMs == 0 || (int32_t)(now - g_otaSfHoldMs) >= 0))
+    if (!ota && !g_otaPulled && g_liveSF != g_loraSF && (g_otaSfHoldMs == 0 || (int32_t)(now - g_otaSfHoldMs) >= 0))
       applyLiveSF(g_loraSF);
   }
 }
