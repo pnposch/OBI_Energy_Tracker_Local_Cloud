@@ -1726,10 +1726,11 @@ static void persistDaily(const String &id, uint32_t dayStart, uint32_t imp, uint
     Serial.println("[history] daily write failed");
 }
 
-static uint32_t localDayStart(time_t ep) {
+static uint32_t localDayStart(time_t ep, int days = 0) {
   struct tm lt;
   localtime_r(&ep, &lt);
   lt.tm_hour = 0; lt.tm_min = 0; lt.tm_sec = 0;
+  lt.tm_mday += days; lt.tm_isdst = -1;
   return (uint32_t)mktime(&lt);
 }
 
@@ -1744,7 +1745,7 @@ static void ftpWindowBounds(uint32_t &startEp, uint32_t &endEp) {
   uint32_t now = (uint32_t)time(nullptr);
   switch (g_ftpWindow) {
     case 1: startEp = now - 24UL * 3600; break;                                   // last 24h (rolling)
-    case 2: endEp = localDayStart((time_t)now); startEp = endEp - 24UL * 3600; break;  // previous calendar day
+    case 2: endEp = localDayStart((time_t)now); startEp = localDayStart((time_t)now, -1); break;  // previous calendar day
     case 3: startEp = now - 7UL * 24 * 3600; break;                               // last 7 days (rolling)
     case 4: startEp = now - 30UL * 24 * 3600; break;                              // last 30 days (rolling)
     default: break;                                                               // 0 = everything stored
