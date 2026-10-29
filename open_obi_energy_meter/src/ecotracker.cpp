@@ -1,3 +1,4 @@
+#include "json_string.h"
 // ecotracker.cpp — everHome EcoTracker IR emulation (see include/ecotracker.h for the why).
 //
 // Two surfaces, both tiny:
@@ -57,7 +58,6 @@ static IPAddress g_mdnsIp;
 static uint32_t  g_lastPollMs = 0;   // last GET /v1/json — the UI's proof that the STREAM is actually talking
 static uint32_t  g_pollCount = 0;
 
-static String jstr(const char *s) { String o = "\""; for (; *s; s++) { if (*s == '"' || *s == '\\') o += '\\'; o += *s; } return o + "\""; }
 
 // "B43A45" + this device's own last 3 MAC bytes: unique per gateway, stable, and still inside the vendor OUI.
 static const char *ecoMac() {
