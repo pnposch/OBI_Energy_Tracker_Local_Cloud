@@ -5,7 +5,11 @@
 #include "bthome_ble.h"
 #include "reader.h"
 #include <assert.h>
+#include <freertos/task.h>
 
+TaskFunction_t testWorker = nullptr;
+bool testTaskFail = false, testMutexFail = false;
+unsigned testTaskCreates = 0;
 uint32_t testMillis = 10000;
 FakeSerial Serial;
 FakeStorage testStorage;
@@ -49,11 +53,13 @@ int main(int argc, char **argv) {
   r.used = r.assigned = r.haveData = true;
   r.flags = 1; r.handle[0] = 1; r.handle[1] = 2; r.handle[2] = 3;
   readers[1] = r; readers[1].handle[2] = 4;
+  testTaskFail = !strcmp(argv[1], "task_failure");
+  testMutexFail = !strcmp(argv[1], "mutex_failure");
   bthome_init(&web);
   statusContains("\"enabled\":false");
   capture(100);
   assert(!testAdvertising.isAdvertising());
-  assert(testBleInitCalls == 0);
+  assert(testBleInitCalls == 0 && !testWorker && testTaskCreates == 0);
 
   if (!strcmp(argv[1], "validation")) {
     web.params = {{"enabled", "1"}, {"reader", "010203"}};
@@ -75,7 +81,14 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  if (testTaskFail || testMutexFail) {
+    web.params = {{"enabled", "1"}, {"reader", "010203"}, {"key", key}};
+    bthome_configure(); assert(web.code == 503 && !testWorker);
+    capture(100); assert(!testAdvertising.isAdvertising());
+    return 0;
+  }
   configure();
+  assert(testTaskCreates == 1 && testWorker);
   statusContains("\"key_set\":true");
   assert(testBleInitCalls == 0);
   capture(-850, 1);
@@ -88,6 +101,27 @@ int main(int argc, char **argv) {
   assert(testAdvertising.duration == 2000);
   assert(sequence() == 0);
 
+  if (!strcmp(argv[1], "worker")) {
+    uint32_t previous = sequence();
+    web.onSend = []() {
+      for (int i = 0; i < 120; ++i) {
+        testMillis += 100;
+        readers[0].lastEnergyMs = testMillis;
+        bthome_capture(readers[0]);
+        workerTick();
+        assert(testAdvertising.isAdvertising());
+      }
+    };
+    bthome_status();
+    assert(sequence() >= previous + 120);
+    web.params = {{"stale_seconds", "5"}};
+    bthome_configure(); assert(web.code == 200);
+    web.onSend = nullptr;
+    for (int i = 0; i < 51; ++i) { testMillis += 100; workerTick(); }
+    assert(!testAdvertising.isAdvertising());
+    bthome_init(&web); assert(testTaskCreates == 1);
+    return 0;
+  }
   if (!strcmp(argv[1], "packet")) {
     for (auto b : testAdvertising.payload) printf("%02x", b);
     puts(""); return 0;

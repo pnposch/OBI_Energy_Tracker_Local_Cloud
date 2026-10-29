@@ -9,6 +9,9 @@
 #include <WebServer.h>
 #include <esp_mac.h>
 #include <mbedtls/ccm.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 namespace {
 
@@ -37,6 +40,30 @@ uint8_t mac[6] = {};
 uint32_t lastSend = 0, lastGeneration = 0, frames = 0;
 bool haveSent = false, counterReady = false;
 const char *error = "";
+SemaphoreHandle_t runtimeMutex = nullptr;
+TaskHandle_t worker = nullptr;
+
+class RuntimeLock {
+ public:
+  RuntimeLock() : held(runtimeMutex && xSemaphoreTake(runtimeMutex, portMAX_DELAY) == pdTRUE) {}
+  ~RuntimeLock() { if (held) xSemaphoreGive(runtimeMutex); }
+  explicit operator bool() const { return held; }
+  RuntimeLock(const RuntimeLock &) = delete;
+  RuntimeLock &operator=(const RuntimeLock &) = delete;
+ private:
+  bool held;
+};
+
+void workerTask(void *) {
+  for (;;) {
+    bthome_service();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+bool startWorker() {
+  return worker || xTaskCreate(workerTask, "obi_bthome", 4096, nullptr, 1, &worker) == pdPASS;
+}
 
 bool reserveCounter(uint64_t high, void *) {
   Preferences p;
@@ -134,6 +161,10 @@ void replyError(int code, const char *message) {
 
 void bthome_init(WebServer *srv) {
   server = srv;
+  if (!runtimeMutex) runtimeMutex = xSemaphoreCreateMutex();
+  if (!runtimeMutex) { error = "Bluetooth lock unavailable"; return; }
+  RuntimeLock lock;
+  if (!lock) return;
   stopAdvertising();
   error = "";
   counterReady = false;
@@ -166,6 +197,8 @@ void bthome_init(WebServer *srv) {
   portENTER_CRITICAL(&sampleMux);
   config = loadedConfig; sample = Sample{};
   portEXIT_CRITICAL(&sampleMux);
+  if (loadedConfig.enabled && counterReady && !startWorker())
+    error = "Bluetooth task unavailable";
 }
 
 void bthome_capture(const Reader &r) {
@@ -187,6 +220,8 @@ void bthome_forget(const uint8_t handle[3]) {
 }
 
 void bthome_service() {
+  RuntimeLock lock;
+  if (!lock) return;
   Config cfg;
   Sample latest;
   portENTER_CRITICAL(&sampleMux);
@@ -237,21 +272,29 @@ void bthome_service() {
 
 void bthome_status() {
   char address[18], handle[7];
-  snprintf(address, sizeof address, "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   Config cfg;
   Sample latest;
-  portENTER_CRITICAL(&sampleMux);
-  cfg = config; latest = sample;
-  portEXIT_CRITICAL(&sampleMux);
+  bool active;
+  uint32_t sent;
+  const char *lastError;
+  {
+    RuntimeLock lock;
+    active = advertising && advertising->isAdvertising();
+    sent = frames; lastError = error;
+    snprintf(address, sizeof address, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    portENTER_CRITICAL(&sampleMux);
+    cfg = config; latest = sample;
+    portEXIT_CRITICAL(&sampleMux);
+  }
   snprintf(handle, sizeof handle, "%02x%02x%02x", cfg.reader[0], cfg.reader[1], cfg.reader[2]);
   String json = "{\"enabled\":" + String(cfg.enabled ? "true" : "false");
   json += ",\"key_set\":" + String(cfg.hasKey ? "true" : "false");
-  json += ",\"advertising\":" + String(advertising && advertising->isAdvertising() ? "true" : "false");
+  json += ",\"advertising\":" + String(active ? "true" : "false");
   json += ",\"mac\":\"" + String(address) + "\",\"reader\":\"" + String(handle) + "\"";
-  json += ",\"stale_seconds\":" + String(cfg.stale) + ",\"frames\":" + String(frames);
+  json += ",\"stale_seconds\":" + String(cfg.stale) + ",\"frames\":" + String(sent);
   json += ",\"sample_age_ms\":" + (latest.valid ? String(uint32_t(millis() - latest.received)) : String("null"));
-  json += ",\"error\":\"" + String(error) + "\"}";
+  json += ",\"error\":\"" + String(lastError) + "\"}";
   server->sendHeader("Cache-Control", "no-store");
   server->send(200, "application/json", json);
 }
@@ -287,17 +330,29 @@ void bthome_configure() {
   if (next.enabled && (!next.hasKey || !hasReader(next.reader))) {
     replyError(400, "Select an assigned meter and provide a key"); return;
   }
-  if (next.enabled && !counterReady) { replyError(503, "Counter unavailable; reboot and inspect storage"); return; }
-  if (!saveConfig(next)) { replyError(503, "Could not save configuration"); return; }
-  stopAdvertising();
-  portENTER_CRITICAL(&sampleMux);
-  config = next; sample = Sample{};
-  portEXIT_CRITICAL(&sampleMux);
-  error = "";
+  const char *failure = nullptr;
+  {
+    RuntimeLock lock;
+    if (!lock) failure = "Bluetooth lock unavailable";
+    else if (next.enabled && !counterReady) failure = "Counter unavailable; reboot and inspect storage";
+    else if (next.enabled && !startWorker()) failure = "Bluetooth task unavailable";
+    else if (!saveConfig(next)) failure = "Could not save configuration";
+    else {
+      stopAdvertising();
+      portENTER_CRITICAL(&sampleMux);
+      config = next; sample = Sample{};
+      portEXIT_CRITICAL(&sampleMux);
+      error = "";
+    }
+  }
+  if (failure) { replyError(503, failure); return; }
   bthome_status();
 }
 
 void bthome_reset() {
+  RuntimeLock lock;
+  if (!lock) return;
+  stopAdvertising();
   portENTER_CRITICAL(&sampleMux);
   config = Config{}; sample = Sample{};
   portEXIT_CRITICAL(&sampleMux);

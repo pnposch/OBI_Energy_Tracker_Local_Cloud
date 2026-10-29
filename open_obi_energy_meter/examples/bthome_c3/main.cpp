@@ -98,7 +98,6 @@ void loop() {
     readers[0].lastEnergyMs = now;
     bthome_capture(readers[0]);
   }
-  bthome_service();
   server.handleClient();
   if (now - lastLog >= 5000) {
     lastLog = now;

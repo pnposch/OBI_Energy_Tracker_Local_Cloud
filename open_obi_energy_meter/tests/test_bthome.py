@@ -134,7 +134,7 @@ def runtime(tmp_path_factory):
 
 
 @pytest.mark.parametrize("scenario", [
-    "validation", "lifecycle", "storage", "key_rotation", "missing_counter", "advertising_error",
+    "validation", "lifecycle", "storage", "key_rotation", "missing_counter", "advertising_error", "worker", "task_failure", "mutex_failure",
 ])
 def test_runtime_behaviour(runtime, scenario):
     subprocess.run([str(runtime), scenario], check=True)

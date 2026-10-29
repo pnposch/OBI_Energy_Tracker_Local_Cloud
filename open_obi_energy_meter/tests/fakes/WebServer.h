@@ -6,6 +6,7 @@
 class WebServer {
  public:
   std::vector<std::pair<String, String>> params;
+  void (*onSend)() = nullptr;
   int code = 0;
   String body;
   int args() const { return params.size(); }
@@ -18,6 +19,6 @@ class WebServer {
     for (const auto &p : params) if (p.first == name) return p.second;
     return "";
   }
-  void send(int status, const char *, const String &data) { code = status; body = data; }
+  void send(int status, const char *, const String &data) { code = status; body = data; if (onSend) onSend(); }
   void sendHeader(const char *, const char *) {}
 };
