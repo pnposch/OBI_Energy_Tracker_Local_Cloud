@@ -924,6 +924,10 @@ static void handleSelfOtaUpload() {
   } else if (up.status == UPLOAD_FILE_END) {
     if (s_selfOtaOk && !Update.end(true)) { Update.printError(Serial); s_selfOtaOk = false; otaHist_abortFlash(); }
     else if (s_selfOtaOk) Serial.printf("[selfota] ok, %u bytes — rebooting\n", up.totalSize);
+  } else if (up.status == UPLOAD_FILE_ABORTED && s_selfOtaOk) {
+    Update.abort();
+    s_selfOtaOk = false;
+    otaHist_abortFlash();
   }
 }
 static void handleSelfOtaDone() {
