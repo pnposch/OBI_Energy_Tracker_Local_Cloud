@@ -18,9 +18,9 @@ struct Filename { const char *c_str() { return "firmware.bin"; } };
 struct HTTPUpload { int status=0; Filename filename; unsigned char *buf=nullptr; size_t currentSize=16, totalSize=16; };
 struct Server { HTTPUpload data; HTTPUpload &upload() { return data; } } server;
 struct Logger { template<typename...T> void printf(const char *,T...) {} } Serial;
-bool paused=false, authorized=true;
+bool paused=false, authorized=true, failSnapshot=false;
 unsigned resumes=0;
-bool otaHist_prepareForFlash() { paused=true; return true; }
+bool otaHist_prepareForFlash() { paused=!failSnapshot; return !failSnapshot; }
 void otaHist_abortFlash() { paused=false; ++resumes; }
 bool authValid() { return authorized; }
 const size_t UPDATE_SIZE_UNKNOWN=~size_t{0};
@@ -54,6 +54,9 @@ int main(int argc,char **argv) {
     assert(Update.aborts==1 && resumes==1);
     event(UPLOAD_FILE_START); event(UPLOAD_FILE_WRITE); event(UPLOAD_FILE_END);
     assert(s_selfOtaOk && !Update.active && paused);
+  } else if(!strcmp(argv[1],"snapshot_failure")) {
+    failSnapshot=true; event(UPLOAD_FILE_START); event(UPLOAD_FILE_WRITE); event(UPLOAD_FILE_END);
+    assert(!paused && !Update.active && !s_selfOtaOk && resumes==0);
   } else if(!strcmp(argv[1],"success")) {
     event(UPLOAD_FILE_START); event(UPLOAD_FILE_WRITE); event(UPLOAD_FILE_END);
     assert(s_selfOtaOk && !Update.active && paused && Update.aborts==0 && resumes==0);
@@ -73,7 +76,7 @@ int main(int argc,char **argv) {
 
 @pytest.mark.parametrize('scenario', [
     'abort_retry', 'success', 'unauthorized', 'foreign_update',
-    'begin_failure', 'write_failure', 'end_failure',
+    'begin_failure', 'write_failure', 'end_failure', 'snapshot_failure',
 ])
 def test_upload_lifecycle(upload_handler, scenario):
     subprocess.run([str(upload_handler), scenario], check=True)

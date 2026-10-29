@@ -1,4 +1,5 @@
 #include "ota_hist.h"
+#include "history_io.h"
 
 #ifdef OBI_OTA_HIST_SUPPORTED
 
@@ -54,24 +55,15 @@ static void copyDir(const char *srcBase, const char *dstBase, uint32_t budget) {
   while ((de = readdir(dir)) != nullptr && budget > 0) {
     String name = de->d_name;
     String sp = String(srcBase) + "/" + name;
-    FILE *sf = fopen(sp.c_str(), "rb");
-    if (!sf) continue;
-    fseek(sf, 0, SEEK_END); long sz = ftell(sf); fseek(sf, 0, SEEK_SET);
-    String all; all.reserve(sz > 0 ? sz : 0);
-    { uint8_t buf[512]; size_t n; while ((n = fread(buf, 1, sizeof buf, sf)) > 0) all.concat((const char *)buf, n); }
-    fclose(sf);
-    String out = all;
-    if ((uint32_t)all.length() > budget) {
-      int cut = (int)all.length() - (int)budget;
-      int nl = all.indexOf('\n', cut > 0 ? cut : 0);
-      out = (nl >= 0) ? all.substring(nl + 1) : String();
+    if (name.length() != 7 || name[0] != 's') continue;
+    String dp = String(dstBase) + "/" + name;
+    size_t written;
+    if (!historyCopy(sp.c_str(), dp.c_str(), budget, written)) {
+      Serial.println("[otahist] copy failed");
+      continue;
     }
-    if (out.length()) {
-      String dp = String(dstBase) + "/" + name;
-      FILE *df = fopen(dp.c_str(), "wb");
-      if (df) { fwrite(out.c_str(), 1, out.length(), df); fclose(df); }
-      budget -= (out.length() > budget) ? budget : (uint32_t)out.length();
-    }
+    budget -= written;
+
   }
   closedir(dir);
 }
@@ -162,11 +154,12 @@ bool otaHist_writesPaused() { return g_paused; }
 // TAIL (write) are on the SAME currently-inactive partition -- never the active one (see the long comment
 // below for why that split matters on this hardware).
 static const int OTA_HIST_MAX_READERS = 64;   // sizing match for gateway_web.cpp's own HIST_SLOTS/MAX_READERS
-static void snapshotBulkIntoTail() {
+static bool snapshotBulkIntoTail() {
   static String names[OTA_HIST_MAX_READERS];
   static long   sizes[OTA_HIST_MAX_READERS];
-  int n = 0; long total = 0;
+  int n = 0;
   DIR *dir = opendir(OTA_HIST_BASE);
+  if (!dir) return false;
   if (dir) {
     struct dirent *de;
     while ((de = readdir(dir)) != nullptr && n < OTA_HIST_MAX_READERS) {
@@ -174,15 +167,18 @@ static void snapshotBulkIntoTail() {
       if (name.length() != 7 || name[0] != 's') continue;   // "/s<6hex>" raw-sample files only
       String sp = String(OTA_HIST_BASE) + "/" + name;
       FILE *f = fopen(sp.c_str(), "rb");
-      if (!f) continue;
-      fseek(f, 0, SEEK_END); long sz = ftell(f); fclose(f);
-      names[n] = name; sizes[n] = sz; total += sz; n++;
+      if (!f) { closedir(dir); return false; }
+      bool ok = fseek(f, 0, SEEK_END) == 0;
+      long sz = ftell(f);
+      fclose(f);
+      if (!ok || sz < 0) { closedir(dir); return false; }
+      names[n] = name; sizes[n] = sz; n++;
     }
     closedir(dir);
   }
-  if (n == 0) return;
+  if (n == 0) return true;
 
-  uint32_t equalShare = OTA_HIST_TAIL_RESERVE / (uint32_t)n;
+  uint32_t equalShare = (OTA_HIST_TAIL_RESERVE * 7 / 8) / (uint32_t)n;
   long slack = 0; int needMore = 0;
   for (int i = 0; i < n; i++) {
     if (sizes[i] <= (long)equalShare) slack += (long)equalShare - sizes[i];
@@ -192,7 +188,7 @@ static void snapshotBulkIntoTail() {
 
   // Reformat TAIL fresh so an old, differently-sized snapshot doesn't linger, then remount it.
   unmountTail();
-  esp_littlefs_format_partition(&g_tailPart);
+  if (esp_littlefs_format_partition(&g_tailPart) != ESP_OK) return false;
   esp_vfs_littlefs_conf_t tconf = {};
   tconf.base_path = OTA_HIST_TAIL_BASE;
   tconf.partition_label = nullptr;
@@ -201,30 +197,19 @@ static void snapshotBulkIntoTail() {
   tconf.dont_mount = false;
   tconf.grow_on_mount = true;
   g_tailMounted = (esp_vfs_littlefs_register(&tconf) == ESP_OK);
-  if (!g_tailMounted) return;
+  if (!g_tailMounted) return false;
 
   for (int i = 0; i < n; i++) {
     uint32_t cap = sizes[i] <= (long)equalShare ? (uint32_t)sizes[i] : boostedShare;
     String sp = String(OTA_HIST_BASE) + "/" + names[i];
-    FILE *sf = fopen(sp.c_str(), "rb");
-    if (!sf) continue;
-    String all; all.reserve(sizes[i] > 0 ? sizes[i] : 0);
-    { uint8_t buf[512]; size_t rn; while ((rn = fread(buf, 1, sizeof buf, sf)) > 0) all.concat((const char *)buf, rn); }
-    fclose(sf);
-    String out = all;
-    if ((uint32_t)all.length() > cap) {   // keep newest, snap to a line boundary (same convention as
-      int cut = (int)all.length() - (int)cap;   // the ongoing per-file compaction in appendSample())
-      int nl = all.indexOf('\n', cut > 0 ? cut : 0);
-      out = (nl >= 0) ? all.substring(nl + 1) : String();
-    }
-    if (out.length()) {
-      String dp = String(OTA_HIST_TAIL_BASE) + "/" + names[i];
-      FILE *df = fopen(dp.c_str(), "wb");
-      if (df) { fwrite(out.c_str(), 1, out.length(), df); fclose(df); }
-    }
+    String dp = String(OTA_HIST_TAIL_BASE) + "/" + names[i];
+    size_t written;
+    if (!historyCopy(sp.c_str(), dp.c_str(), cap, written)) return false;
+
   }
   Serial.printf("[otahist] snapshotted %d reader(s) into the %lu KB tail reserve before flashing\n",
                 n, (unsigned long)(OTA_HIST_TAIL_RESERVE / 1024));
+  return true;
 }
 
 // This USED to try to relocate history data into the active partition's tail here, before Update.begin()
@@ -249,7 +234,11 @@ static void snapshotBulkIntoTail() {
 // partition (never erasing/writing there -- see above), then reseeds BULK from it.
 bool otaHist_prepareForFlash() {
   g_paused = true;
-  if (g_bulkMounted) snapshotBulkIntoTail();
+  if (g_bulkMounted && !snapshotBulkIntoTail()) {
+    g_paused = false;
+    Serial.println("[otahist] snapshot failed; update cancelled");
+    return false;
+  }
   unmountBulk(); unmountTail();   // release both VFS handles -- Update.begin() is about to overwrite this partition
   return true;
 }
@@ -278,7 +267,7 @@ void otaHist_regionInfo(uint32_t &addr, uint32_t &size) {
 bool otaHist_mount() { return false; }
 bool otaHist_mounted() { return false; }
 bool otaHist_format() { return false; }
-bool otaHist_prepareForFlash() { return false; }
+bool otaHist_prepareForFlash() { return true; }
 void otaHist_abortFlash() {}
 bool otaHist_writesPaused() { return false; }
 void otaHist_space(size_t &total, size_t &used) { total = used = 0; }
