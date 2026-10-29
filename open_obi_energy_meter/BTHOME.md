@@ -109,9 +109,13 @@ follows the dashboard: without a configured login, its APIs are open locally.
   BLE repeats it at 100–150 ms intervals. This does not increase the reader's
   measurement rate; set the LoRa upload interval separately in the dashboard.
 - Each advertising burst has a controller-enforced deadline of at most two
-  seconds, capped by the sample's remaining lifetime. A blocked web task stops
-  refreshing BLE; it cannot keep an old advertisement running indefinitely.
-  Long dashboard/network operations may therefore introduce advertising gaps.
+  seconds, capped by the sample's remaining lifetime. A dedicated FreeRTOS task
+  services BLE every 100 ms, independently of web, MQTT and GitHub requests.
+  It starts on first enable and uses a 4096-byte stack. Disabled fresh boots
+  allocate neither the worker nor NimBLE. Runtime state, counter reservation,
+  configuration and advertising operations are serialized with a mutex; HTTP
+  responses are sent after releasing it. Finite advertising still expires if
+  the worker stalls.
 - Wi-Fi/MQTT/cloud delivery is not required for BLE output after setup. The
   existing dashboard remains available for configuration and firmware updates.
 - The receiver may retain its last value after advertisements stop. Its timeout

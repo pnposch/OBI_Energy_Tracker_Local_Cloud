@@ -3372,7 +3372,6 @@ static void webTask(void *) {
 
   for (;;) {
     if (g_portalReq) { g_portalReq = false; runPortal(); }   // WiFi button pressed -> open the WM portal
-    bthome_service();
     // Watch WiFi transitions (e.g. after an in-dashboard connect): drop the setup AP once connected,
     // raise it again if WiFi is lost — so the dashboard is always reachable (STA IP or 192.168.4.1).
     bool conn = WiFi.status() == WL_CONNECTED;
