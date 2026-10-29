@@ -11,7 +11,9 @@ The USB bench runs the production BLE modules with simulated readings. Actual
 received packets passed authenticated decryption using PyCryptodome and Home
 Assistant's `bthome-ble` parser for +1234, 0 and -850 W. BLE also continued with
 the test Wi-Fi AP enabled/disabled, stopped after sample expiry and resumed
-after restart with a higher persisted counter. See the
+after restart with a higher persisted counter. The dedicated worker continued
+through a twelve-second blocked web loop with fresh simulated readings and
+expired stale readings while that loop remained blocked. See the
 [bench instructions](examples/bthome_c3/README.md).
 
 This does not establish RF range, full gateway heap usage, coexistence under
