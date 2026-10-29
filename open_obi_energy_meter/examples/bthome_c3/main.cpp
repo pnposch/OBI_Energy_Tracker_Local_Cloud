@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <atomic>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -11,9 +12,9 @@
 const int MAX_READERS = 1;
 Reader readers[MAX_READERS];
 static WebServer server(80);
-static bool paused = false, automatic = true;
-static int32_t power = 1234;
-static uint32_t lastSample = 0, lastLog = 0;
+static std::atomic<bool> paused{false}, automatic{true};
+static std::atomic<int32_t> power{1234};
+static uint32_t lastLog = 0;
 static String command;
 
 static bool seedConfig() {
@@ -38,6 +39,30 @@ static void wifiOn() {
   WiFi.softAP("OBI-BLE-Test", BENCH_AP_PASSWORD);
 }
 
+static void sampleTask(void *) {
+  for (;;) {
+    if (!paused.load()) {
+      uint32_t now = millis();
+      if (automatic.load()) {
+        const int32_t values[] = {1234, 0, -850};
+        power = values[(now / 10000) % 3];
+      }
+      readers[0].power = static_cast<uint32_t>(power.load());
+      readers[0].lastEnergyMs = now;
+      bthome_capture(readers[0]);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+static void blockWeb(bool stale) {
+  paused = stale;
+  uint32_t started = millis();
+  Serial.printf("BLOCK start mode=%s\n", stale ? "stale" : "fresh");
+  delay(12000);
+  Serial.printf("BLOCK end elapsed=%lu\n", (unsigned long)(millis() - started));
+}
+
 static void runCommand() {
   command.trim();
   if (command == "pause") paused = true;
@@ -45,6 +70,8 @@ static void runCommand() {
   else if (command == "auto") { automatic = true; paused = false; }
   else if (command == "wifi off") WiFi.mode(WIFI_OFF);
   else if (command == "wifi on") wifiOn();
+  else if (command == "block") blockWeb(false);
+  else if (command == "block stale") blockWeb(true);
   else if (command == "reboot") { Serial.println("Rebooting"); Serial.flush(); delay(100); ESP.restart(); }
   else if (command.startsWith("power ")) {
     char *end = nullptr;
@@ -57,7 +84,6 @@ static void runCommand() {
   } else { Serial.println("Unknown command"); command = ""; return; }
   Serial.println("OK " + command);
   command = "";
-  lastSample = millis() - 1000;
 }
 
 void setup() {
@@ -76,6 +102,10 @@ void setup() {
   }
   wifiOn();
   bthome_init(&server);
+  if (xTaskCreate(sampleTask, "bench_samples", 2048, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("Sample task creation failed");
+    for (;;) delay(1000);
+  }
   server.on("/api/bthome", HTTP_GET, bthome_status);
   server.begin();
   Serial.println("Ready: +1234 / 0 / -850 W");
@@ -88,21 +118,11 @@ void loop() {
     else if (ch != '\r' && command.length() < 80) command += ch;
   }
   uint32_t now = millis();
-  if (!paused && now - lastSample >= 1000) {
-    lastSample = now;
-    if (automatic) {
-      const int32_t values[] = {1234, 0, -850};
-      power = values[(now / 10000) % 3];
-    }
-    readers[0].power = static_cast<uint32_t>(power);
-    readers[0].lastEnergyMs = now;
-    bthome_capture(readers[0]);
-  }
   server.handleClient();
   if (now - lastLog >= 5000) {
     lastLog = now;
     Serial.printf("BENCH ms=%lu power=%ld paused=%u heap=%u min_heap=%u wifi=%u\n",
-                  (unsigned long)now, (long)power, paused, ESP.getFreeHeap(),
+                  (unsigned long)now, (long)power.load(), unsigned(paused.load()), ESP.getFreeHeap(),
                   ESP.getMinFreeHeap(), unsigned(WiFi.getMode()));
   }
   delay(5);
